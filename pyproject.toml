@@ -1,0 +1,52 @@
+[project]
+name = "inference-engine"
+version = "0.1.0"
+description = "Nano-vLLM style inference engine with paged KV cache, continuous batching, and speculative decoding"
+readme = "README.md"
+authors = [
+    { name = "Emmanuel Ajala", email = "ajalae2@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.40",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "tokenizers>=0.19",
+    "triton>=2.3",
+    "flash-attn>=2.5",
+    "einops>=0.8",
+    "numpy>=1.24",
+    "tqdm>=4.66",
+    "uvicorn>=0.29",
+    "fastapi>=0.110",
+    "pydantic>=2.7",
+    "bitsandbytes>=0.43",
+    "autoawq>=0.2",
+    "auto-gptq>=0.7",
+]
+
+[project.scripts]
+inference-engine = "inference_engine.cli.main:main"
+inference-serve = "inference_engine.api.server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff.lint]
+extend-select = [
+    "F", "W", "E", "I", "UP", "C4", "FA", "ISC",
+    "ICN", "RET", "SIM", "TID", "TC", "PTH", "TD",
+    "NPY", "FURB",
+]
+
+[tool.ruff.format]
+quote-style = "double"

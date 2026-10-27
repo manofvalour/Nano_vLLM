@@ -1,11 +1,11 @@
-import os
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 
 # Add the src directory to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from inference_engine.attention.paged_attn import (
     BLOCK_SIZE,
@@ -119,10 +119,9 @@ class TestPagedAttention:
         """Test basic paged attention computation."""
         num_seqs = 2
         seq_lens = torch.tensor([8, 12], device=self.device)
-        total_tokens = seq_lens.sum().item()
 
         # Create test tensors
-        query = torch.randn(num_seqs,self.num_heads, self.head_dim, device=self.device)
+        query = torch.randn(num_seqs, self.num_heads, self.head_dim, device=self.device)
         key_cache = torch.zeros(
             3, self.num_kv_heads, self.block_size, self.head_dim, device=self.device
         )
@@ -248,7 +247,9 @@ class TestPagedAttention:
                 block_offset = pos % self.block_size
                 expected_slots.append(block_id * self.block_size + block_offset)
 
-        assert torch.allclose(slot_mapping, torch.tensor(expected_slots, dtype= slot_mapping.dtype, device=self.device))
+        assert torch.allclose(
+            slot_mapping, torch.tensor(expected_slots, dtype=slot_mapping.dtype, device=self.device)
+        )
 
     def test_get_block_ids_basic(self):
         """Test basic block ID retrieval."""
@@ -276,7 +277,9 @@ class TestPagedAttention:
             for pos in range(seq_lens[seq_id].item()):
                 expected_block_ids.append(block_tables[seq_id, pos // self.block_size].item())
 
-        assert torch.allclose(block_ids, torch.tensor(expected_block_ids, dtype=block_ids.dtype, device=self.device))
+        assert torch.allclose(
+            block_ids, torch.tensor(expected_block_ids, dtype=block_ids.dtype, device=self.device)
+        )
 
     def test_reshape_and_cache(self):
         """Test reshape and cache functionality."""
@@ -434,12 +437,11 @@ class TestPagedAttention:
             )
 
             # Create block tables
-            block_tables = torch.tensor([[0, 1, 1],
-                                         [1, 2, 0]], device=self.device)
+            block_tables = torch.tensor([[0, 1, 1], [1, 2, 0]], device=self.device)
 
             # Fill cache with test data
             for seq_id in range(num_seqs):
-                seq_len = seq_lens[seq_id].item() #4
+                seq_len = seq_lens[seq_id].item()  # 4
                 for pos in range(seq_len):
                     block_id = block_tables[seq_id, pos // block_size].item()
                     block_offset = pos % block_size
@@ -468,6 +470,158 @@ class TestPagedAttention:
             # Verify output shape
             assert output.shape == query.shape
             assert not torch.allclose(output, torch.zeros_like(output))
+
+    def test_reshape_and_cache_rewrites_duplicate_slots(self):
+        """reshape_and_cache should behave like store_kvcache when slots repeat."""
+        num_tokens = 4
+        num_blocks = 2
+        slot_mapping = torch.tensor([0, 0, 1, 1], device=self.device, dtype=torch.long)
+        key = torch.randn(num_tokens, self.num_kv_heads, self.head_dim, device=self.device)
+        value = torch.randn(num_tokens, self.num_kv_heads, self.head_dim, device=self.device)
+        key_cache = torch.zeros(
+            num_blocks, self.num_kv_heads, self.block_size, self.head_dim, device=self.device
+        )
+        value_cache = torch.zeros_like(key_cache)
+
+        reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            num_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            self.block_size,
+        )
+
+        assert torch.allclose(key_cache[0, :, 0, :], key[1])
+        assert torch.allclose(value_cache[0, :, 0, :], value[1])
+        assert torch.allclose(key_cache[0, :, 1, :], key[3])
+        assert torch.allclose(value_cache[0, :, 1, :], value[3])
+
+    def test_compute_slot_mapping_with_sparse_non_contiguous_blocks(self):
+        """Slot mapping should respect arbitrary block tables and sequence lengths."""
+        num_seqs = 2
+        seq_lens = torch.tensor([5, 3], device=self.device, dtype=torch.int32)
+        block_tables = torch.tensor(
+            [
+                [2, 7, 4],  # seq 0 -> blocks 2, 7, 4
+                [1, 1, 5],  # seq 1 -> blocks 1, 1, 5
+            ],
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        slot_mapping = compute_slot_mapping(block_tables, seq_lens, num_seqs, self.block_size)
+
+        expected = []
+        for seq_id in range(num_seqs):
+            for pos in range(seq_lens[seq_id].item()):
+                block_id = block_tables[seq_id, pos // self.block_size].item()
+                block_offset = pos % self.block_size
+                expected.append(block_id * self.block_size + block_offset)
+
+        assert slot_mapping.shape == (seq_lens.sum().item(),)
+        assert torch.equal(
+            slot_mapping, torch.tensor(expected, device=self.device, dtype=slot_mapping.dtype)
+        )
+
+    def test_get_block_ids_with_sparse_non_contiguous_blocks(self):
+        """get_block_ids should return one block per token in order, regardless of block IDs."""
+        num_seqs = 2
+        seq_lens = torch.tensor([5, 3], device=self.device, dtype=torch.int32)
+        block_tables = torch.tensor(
+            [
+                [2, 7, 4],
+                [1, 1, 5],
+            ],
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        block_ids = get_block_ids(block_tables, seq_lens, num_seqs, self.block_size)
+
+        expected = []
+        for seq_id in range(num_seqs):
+            for pos in range(seq_lens[seq_id].item()):
+                expected.append(block_tables[seq_id, pos // self.block_size].item())
+
+        assert block_ids.shape == (seq_lens.sum().item(),)
+        assert torch.equal(
+            block_ids, torch.tensor(expected, device=self.device, dtype=block_ids.dtype)
+        )
+
+    def test_paged_attention_multiple_sequences_are_independent(self):
+        """Each sequence should attend only to its own context length."""
+        num_seqs = 2
+        seq_lens = torch.tensor([2, 4], device=self.device, dtype=torch.int32)
+        num_heads = 2
+        num_kv_heads = 2
+        head_dim = 4
+        block_size = 4
+
+        query = torch.randn(num_seqs, num_heads, head_dim, device=self.device)
+        key_cache = torch.zeros((3, num_kv_heads, block_size, head_dim), device=self.device)
+        value_cache = torch.zeros_like(key_cache)
+
+        block_tables = torch.tensor([[0], [1]], device=self.device, dtype=torch.int32)
+        seq0_key = torch.randn(seq_lens[0].item(), num_kv_heads, head_dim, device=self.device)
+        seq0_val = torch.randn(seq_lens[0].item(), num_kv_heads, head_dim, device=self.device)
+        seq1_key = torch.randn(seq_lens[1].item(), num_kv_heads, head_dim, device=self.device)
+        seq1_val = torch.randn(seq_lens[1].item(), num_kv_heads, head_dim, device=self.device)
+
+        key_cache[0, :, : seq_lens[0].item(), :] = seq0_key.transpose(0, 1)
+        value_cache[0, :, : seq_lens[0].item(), :] = seq0_val.transpose(0, 1)
+        key_cache[1, :, : seq_lens[1].item(), :] = seq1_key.transpose(0, 1)
+        value_cache[1, :, : seq_lens[1].item(), :] = seq1_val.transpose(0, 1)
+
+        output = paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            num_seqs,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            self.max_context_len,
+        )
+
+        assert output.shape == query.shape
+        assert not torch.allclose(output, torch.zeros_like(output))
+
+    def test_compute_slot_mapping_handles_repeated_blocks(self):
+        """Repeated block IDs inside a block table should still produce correct flattened slots."""
+        num_seqs = 1
+        seq_lens = torch.tensor([8], device=self.device, dtype=torch.int32)
+        block_tables = torch.tensor([[1, 1, 1, 1]], device=self.device, dtype=torch.int32)
+
+        slot_mapping = compute_slot_mapping(block_tables, seq_lens, num_seqs, self.block_size)
+
+        expected = []
+        for pos in range(seq_lens[0].item()):
+            block_id = block_tables[0, pos // self.block_size].item()
+            expected.append(block_id * self.block_size + (pos % self.block_size))
+
+        assert torch.equal(
+            slot_mapping, torch.tensor(expected, device=self.device, dtype=slot_mapping.dtype)
+        )
+
+    def test_get_block_ids_handles_repeated_blocks(self):
+        """get_block_ids should return repeated block IDs when the block table repeats blocks."""
+        num_seqs = 1
+        seq_lens = torch.tensor([8], device=self.device, dtype=torch.int32)
+        block_tables = torch.tensor([[3, 3, 3, 3]], device=self.device, dtype=torch.int32)
+
+        block_ids = get_block_ids(block_tables, seq_lens, num_seqs, self.block_size)
+
+        expected = [3] * seq_lens[0].item()
+        assert torch.equal(
+            block_ids, torch.tensor(expected, device=self.device, dtype=block_ids.dtype)
+        )
 
 
 if __name__ == "__main__":

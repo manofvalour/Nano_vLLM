@@ -1,5 +1,4 @@
 import math
-import time
 from collections.abc import Sequence
 
 import torch
@@ -8,11 +7,7 @@ from inference_engine.core.block import Block, BlockTable
 
 
 class BlockManager:
-    """Simple block manager for allocating/freeing blocks and caching by hash.
-
-    This implementation is intentionally lightweight and deterministic so it
-    can be used by other modules that need block bookkeeping.
-    """
+    """Simple block manager for allocating/freeing blocks and caching by hash."""
 
     def __init__(self, num_blocks: int, block_size: int):
         if num_blocks < 0 or block_size <= 0:
@@ -37,8 +32,8 @@ class BlockManager:
         ids = [self.free_block.pop() for _ in range(n)]
         # mark as referenced
         for i in ids:
-            self.blocks[i].ref_count = 1
-            self.blocks[i].last_accessed = time.time()
+            self.blocks[i].inc_ref()
+            self.blocks[i].touch()
 
         tensor = torch.tensor(ids, dtype=torch.int32)
         if device is not None:
@@ -50,9 +45,10 @@ class BlockManager:
         for bid in block_ids:
             if 0 <= int(bid) < self.num_blocks:
                 b = self.blocks[int(bid)]
-                if b.block_hash is not None:
-                    self.block_table.remove(b.block_hash)
-                b.reset_block()
+                block_hash = b.block_hash()
+                if block_hash is not None:
+                    self.block_table.remove(block_hash)
+                b.reset()
                 if int(bid) not in self.free_block:
                     self.free_block.append(int(bid))
 
@@ -86,7 +82,7 @@ class BlockManager:
         existing = self.block_table.get(bh)
         if existing is not None:
             # touch existing
-            self.blocks[existing].last_accessed = time.time()
+            self.blocks[existing].touch()
             return existing
 
         if not self.free_block:
@@ -94,12 +90,12 @@ class BlockManager:
 
         bid = self.free_block.pop()
         self.blocks[bid].update_block(token_ids, bh)
-        self.blocks[bid].inc_ref = 1
+        self.blocks[bid].inc_ref()
         self.block_table.add(bh, bid)
         return bid
 
     def try_get_prefix_blocks(self, token_ids: Sequence[int], num_cached_tokens: int) -> list[int]:
-        """Try to retrieve cached block ids covering the first `num_cached_tokens` tokens.
+        """Try to retrieve cached block ids covering the prefill `num_cached_tokens` tokens.
 
         Returns list of block ids for consecutive blocks starting at token 0 that are cached.
         """
@@ -127,11 +123,13 @@ class BlockManager:
         """
         for bid in block_ids_out:
             if 0 <= int(bid) < self.num_blocks:
-                self.blocks[int(bid)].ref_count = max(0, self.blocks[int(bid)].ref_count - 1)
+                self.blocks[
+                    int(bid)
+                ].dec_ref()  # _count = max(0, self.blocks[int(bid)].ref_count - 1)
         for bid in block_ids_in:
             if 0 <= int(bid) < self.num_blocks:
-                self.blocks[int(bid)].ref_count += 1
-                self.blocks[int(bid)].last_accessed = time.time()
+                self.blocks[int(bid)].inc_ref()
+                self.blocks[int(bid)].touch()  # last_accessed = time.time()
 
     def num_free(self) -> int:
         return len(self.free_block)

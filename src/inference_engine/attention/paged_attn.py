@@ -1,7 +1,7 @@
-
 import torch
 import torch.nn.functional as F
-#from attention.naive_attn import MHA
+
+# from attention.naive_attn import MHA
 
 # PagedAttention kernel implementation using Triton
 # Based on vLLM's paged attention implementation
@@ -63,7 +63,7 @@ def paged_attention(
     head_dim: int,
     block_size: int = BLOCK_SIZE,
     max_context_len: int = 4096,
-    softmax_scale: float|None = None,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor:
     """
     Paged attention computation with block table lookups.
@@ -86,7 +86,7 @@ def paged_attention(
         Output tensor of shape [num_seqs, num_heads, head_dim]
     """
     output = torch.zeros(num_seqs, num_heads, head_dim)  # num_seq, num_head, head_dim
-    group_size = num_heads//num_kv_heads
+    group_size = num_heads // num_kv_heads
     assert num_heads % num_kv_heads == 0
 
     if softmax_scale is None:
@@ -98,7 +98,7 @@ def paged_attention(
         if seq_len == 0:
             continue
 
-        if seq_len >max_context_len:
+        if seq_len > max_context_len:
             raise ValueError("Context Exceed Max Context Len")
 
         # Get block table for this sequence
@@ -119,18 +119,18 @@ def paged_attention(
         K = torch.stack(keys, dim=0)
         V = torch.stack(values, dim=0)
 
-        K = K.repeat_interleave(group_size,dim=1)
+        K = K.repeat_interleave(group_size, dim=1)
         V = V.repeat_interleave(group_size, dim=1)
 
         Q = query[seq_id]
         # Compute attention scores
-        attn_scores = torch.einsum("hd,thd->ht", Q,K) * softmax_scale
-        #attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale
+        attn_scores = torch.einsum("hd,thd->ht", Q, K) * softmax_scale
+        # attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * softmax_scale
         attn_weights = F.softmax(attn_scores, dim=-1)
 
         # Compute output
-        output[seq_id] = torch.einsum("ht, thd->hd", attn_weights,V)
-        #output[seq_id] = torch.matmul(attn_weights, V)
+        output[seq_id] = torch.einsum("ht, thd->hd", attn_weights, V)
+        # output[seq_id] = torch.matmul(attn_weights, V)
 
     return output
 
