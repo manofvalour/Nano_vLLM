@@ -44,6 +44,7 @@ class Sequence:
     status: SequenceStatus = SequenceStatus.WAITING
     num_cached_tokens: int = 0
     num_computed_tokens: int = 0
+    num_prefilled: int = 0
     output_token_ids: list[int] = field(default_factory=list)
     output_logprobs: list[float] = field(default_factory=list)
     cumulative_logprob: float = 0.0
@@ -80,8 +81,14 @@ class Sequence:
             self.output_logprobs = list(self.output_logprobs)
         self.output_logprobs = [float(lp) for lp in self.output_logprobs]
 
-        self.num_cached_tokens = max(0, self.num_cached_tokens)
-        self.num_computed_tokens = max(0, self.num_computed_tokens)
+        self.num_cached_tokens = max(0, int(self.num_cached_tokens))
+        self.num_computed_tokens = max(0, int(self.num_computed_tokens))
+        self.num_prefilled = max(0, int(self.num_prefilled))
+
+        if self.num_prefilled == 0 and self.num_cached_tokens > 0:
+            self.num_prefilled = self.num_cached_tokens
+        if self.num_cached_tokens == 0 and self.num_prefilled > 0:
+            self.num_cached_tokens = self.num_prefilled
 
     @property
     def prompt_len(self) -> int:
@@ -106,6 +113,26 @@ class Sequence:
     @property
     def num_new_tokens(self) -> int:
         return self.output_len
+
+    def clone_shallow(self) -> "Sequence":
+        """Create a shallow clone that copies current state but shares physical blocks."""
+        return Sequence(
+            seq_id=self.seq_id,
+            prompt=self.prompt,
+            prompt_token_ids=self.prompt_token_ids.copy(),
+            sampling_params=self.sampling_params,
+            block_table=self.block_table.copy(),
+            status=self.status,
+            num_cached_tokens=self.num_cached_tokens,
+            num_computed_tokens=self.num_computed_tokens,
+            num_prefilled=self.num_prefilled,
+            output_token_ids=self.output_token_ids.copy(),
+            output_logprobs=self.output_logprobs.copy(),
+            cumulative_logprob=self.cumulative_logprob,
+            finish_reason=self.finish_reason,
+            priority=self.priority,
+            arrival_time=self.arrival_time,
+        )
 
     def _sampling_param(self, key: str, default: Any = None) -> Any:
         if self.sampling_params is None:
@@ -169,6 +196,7 @@ class Sequence:
 
         self.status = SequenceStatus.WAITING
         self.num_cached_tokens = max(0, self.num_cached_tokens)
+        self.num_prefilled = max(self.num_prefilled, self.num_cached_tokens)
         self.finish_reason = None
 
     def __len__(self) -> int:
