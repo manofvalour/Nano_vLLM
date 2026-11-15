@@ -16,19 +16,26 @@ from inference_engine.core.sequence import (
 
 
 class Scheduler:
-    """Lightweight scheduler for waiting, running, and preempted sequences.
+    """scheduler for waiting, running, and preempted sequences.
+
+    The default policy design is that the running decode sequences are
+    admitted first, then waiting prompts are added as bounded prefill chunks.
     """
     def __init__(
         self,
         *,
         block_size: int = 16,
         max_num_batched_tokens: int = 4096,
+        max_num_seqs: int = 256,
+        max_prefill_chunk: int = 2048,
         enable_chunked_prefill: bool = True,
         enable_preemption: bool = True,
         block_manager: BlockManager | None = None,
     ) -> None:
         self.block_size = int(block_size)
         self.max_num_batched_tokens = int(max_num_batched_tokens)
+        self.max_num_seqs = int(max_num_seqs)
+        self.max_prefill_chunk = int(max_prefill_chunk)
         self.enable_chunked_prefill = bool(enable_chunked_prefill)
         self.enable_preemption = bool(enable_preemption)
         self.block_manager = block_manager
@@ -37,6 +44,10 @@ class Scheduler:
             raise ValueError("block_size must be > 0")
         if self.max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be > 0")
+        if self.max_num_seqs <= 0:
+            raise ValueError("max_num_seqs must be > 0")
+        if self.max_prefill_chunk <= 0:
+            raise ValueError("max_prefill_chunk must be > 0")
 
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
@@ -53,7 +64,6 @@ class Scheduler:
         elif isinstance(seq_group, list):
             if not seq_group:
                 return
-            # Accept a plain list of sequences by synthesizing a request group.
             seq_group = SequenceGroup(
                 request_id=f"group-{len(self._groups)}",
                 sequences=list(seq_group),
@@ -70,9 +80,9 @@ class Scheduler:
                 if seq not in self.running:
                     self.running.append(seq)
                 continue
-            if (seq.status == SequenceStatus.WAITING and
-                seq not in self.waiting) or (seq.status == SequenceStatus.SWAPPED
-                                             and seq not in self.waiting):
+            if (seq.status == SequenceStatus.WAITING and seq not in self.waiting) or (
+                seq.status == SequenceStatus.SWAPPED and seq not in self.waiting
+            ):
                 self.waiting.append(seq)
 
     def seq_group(self, seq_group: SequenceGroup | list[Sequence] | Sequence) -> None:
@@ -80,32 +90,46 @@ class Scheduler:
 
         self._add_sequence_group(seq_group)
 
-    def _can_allocate_for_prefill(self, seq: Sequence) -> bool:
-        if self.block_manager is None:
-            return True
-        needed = self._compute_needed_blocks(seq)
-        return self.block_manager.can_allocate(needed)
-
-    def _compute_needed_blocks(self, seq: Sequence | None) -> int:
+    def _remaining_prompt_tokens(self, seq: Sequence) -> int:
+        """Tokens still needing prefill for the current request."""
         if seq is None:
             return 0
-        if seq.prompt_len == 0 and seq.output_len == 0:
-            return 0
-        tokens = max(seq.total_len, 1)
-        return max(1, math.ceil(tokens / self.block_size))
+        computed = max(0, int(getattr(seq, "num_computed_tokens", 0)))
+        return max(0, seq.prompt_len - computed)
 
-    def _allocate_blocks_for_prefill(self, seq: Sequence) -> list[int]:
+    def _prefill_chunk_tokens(self, seq: Sequence, remaining_budget: int) -> int:
+        """Return the capped prefill chunk size for a single waiting sequence."""
+        remaining_prompt = self._remaining_prompt_tokens(seq)
+        if remaining_prompt <= 0 or remaining_budget <= 0:
+            return 0
+
+        cap = self.max_prefill_chunk if self.enable_chunked_prefill else remaining_prompt
+        return max(1, min(remaining_prompt, cap, remaining_budget))
+
+    def _can_allocate_for_prefill(self, seq: Sequence, *, chunk_tokens: int | None = None) -> bool:
+        if self.block_manager is None:
+            return True
+        if chunk_tokens is None:
+            chunk_tokens = self._remaining_prompt_tokens(seq)
+        needed = 0 if chunk_tokens <= 0 else max(1, math.ceil(chunk_tokens / self.block_size))
+        return self.block_manager.can_allocate(needed)
+
+    def _allocation_target(self, seq: Sequence, *, chunk_tokens: int | None = None) -> int:
+        if chunk_tokens is None:
+            chunk_tokens = self._remaining_prompt_tokens(seq)
+        return 0 if chunk_tokens <= 0 else max(1, math.ceil(chunk_tokens / self.block_size))
+
+    def _allocate_blocks_for_prefill(self, seq: Sequence, *, chunk_tokens: int | None = None) -> list[int]:
         if seq is None:
             return []
 
-        needed = self._compute_needed_blocks(seq)
-        if needed == 0:
+        if chunk_tokens is None:
+            chunk_tokens = self._remaining_prompt_tokens(seq)
+        if chunk_tokens <= 0:
             return list(seq.block_table)
 
+        needed = self._allocation_target(seq, chunk_tokens=chunk_tokens)
         if self.block_manager is not None:
-            # Try to allocate only additional blocks for the sequence.
-            # The block manager is expected to track capacity globally, but the
-            # scheduler keeps the logical block IDs on the sequence itself.
             current_needed = len(seq.block_table)
             additional = max(0, needed - current_needed)
             if additional > 0:
@@ -113,8 +137,6 @@ class Scheduler:
                 seq.block_table.extend(int(block_id) for block_id in allocated.tolist())
             return list(seq.block_table)
 
-        # No global block manager. Keep a lightweight logical view for tests and
-        # callers that only care about sequence-level scheduling behavior.
         return list(seq.block_table)
 
     def _schedule_running(self, outputs: SchedulerOutputs) -> None:
@@ -138,8 +160,13 @@ class Scheduler:
     def _schedule_waiting(self, outputs: SchedulerOutputs) -> None:
         """Admit waiting sequences into prefill or chunked-prefill work."""
 
-        # Copy the queue to avoid mutating while iterating.
-        candidates = list(self.waiting)
+        if len(self.running) + len(outputs.decode_seqs) >= self.max_num_seqs:
+            return
+
+        candidates = sorted(
+            [seq for seq in self.waiting if not seq.is_finished],
+            key=lambda seq: (seq.priority, seq.arrival_time, seq.seq_id),
+        )
         for seq in candidates:
             if seq.is_finished:
                 self.waiting.remove(seq)
@@ -149,28 +176,36 @@ class Scheduler:
                 self.waiting.remove(seq)
                 continue
 
-            if outputs.num_batched_tokens >= self.max_num_batched_tokens: #checking token budget
+            if outputs.num_batched_tokens >= self.max_num_batched_tokens:
                 break
 
-            if not self._can_allocate_for_prefill(seq): #check memory size for kv-cache storage
-                continue
-
-            if self.enable_chunked_prefill and seq.prompt_len > self.block_size:
-                self._allocate_blocks_for_prefill(seq)
+            remaining_prompt = self._remaining_prompt_tokens(seq)
+            if remaining_prompt <= 0:
+                self.waiting.remove(seq)
                 seq.status = SequenceStatus.RUNNING
-                outputs.chunked_prefill_seqs.append(seq)
                 if seq not in self.running:
                     self.running.append(seq)
-                outputs.num_batched_tokens += max(1, seq.prompt_len)
-                self.waiting.remove(seq)
+                outputs.decode_seqs.append(seq)
+                outputs.num_batched_tokens += max(1, seq.total_len)
                 continue
 
-            self._allocate_blocks_for_prefill(seq)
+            remaining_budget = max(0, self.max_num_batched_tokens - outputs.num_batched_tokens)
+            chunk_tokens = self._prefill_chunk_tokens(seq, remaining_budget)
+            if chunk_tokens <= 0:
+                break
+
+            if not self._can_allocate_for_prefill(seq, chunk_tokens=chunk_tokens):
+                break
+
+            self._allocate_blocks_for_prefill(seq, chunk_tokens=chunk_tokens)
             seq.status = SequenceStatus.RUNNING
-            outputs.prefill_seqs.append(seq)
             if seq not in self.running:
                 self.running.append(seq)
-            outputs.num_batched_tokens += max(1, seq.prompt_len)
+            if self.enable_chunked_prefill and remaining_prompt > chunk_tokens:
+                outputs.chunked_prefill_seqs.append(seq)
+            else:
+                outputs.prefill_seqs.append(seq)
+            outputs.num_batched_tokens += chunk_tokens
             self.waiting.remove(seq)
 
     def _handle_preemption(self, outputs: SchedulerOutputs) -> None:
@@ -187,14 +222,14 @@ class Scheduler:
         if not waiting_priorities or not running_priorities:
             return
 
-        highest_waiting = max(waiting_priorities) #biggest priority in waiting pool
-        lowest_running = min(running_priorities) #lowest priority in running pool
-        if highest_waiting <= lowest_running: #no preemption nned to occur
+        highest_waiting = max(waiting_priorities)
+        lowest_running = min(running_priorities)
+        if highest_waiting <= lowest_running:
             return
 
         for seq in sorted(
             [s for s in self.running if not s.is_finished],
-            key=lambda item: (item.priority, item.arrival_time), ##sort descending by priority/arriv
+            key=lambda item: (item.priority, item.arrival_time, item.seq_id),
         ):
             if seq.priority >= highest_waiting:
                 continue
@@ -212,7 +247,7 @@ class Scheduler:
         outputs = SchedulerOutputs()
         self._handle_preemption(outputs)
         self._schedule_running(outputs)
-        if outputs.num_batched_tokens < self.max_num_batched_tokens: #waiting_token>token_budget
+        if outputs.num_batched_tokens < self.max_num_batched_tokens:
             self._schedule_waiting(outputs)
         return outputs
 
